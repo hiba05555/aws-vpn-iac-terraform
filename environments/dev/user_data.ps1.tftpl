@@ -1,0 +1,100 @@
+<powershell>
+$ErrorActionPreference = "Stop"
+
+# =========================
+# DOMAIN JOIN CONFIG
+# =========================
+$Domain   = "corp.internal"
+$JoinUser = "corp.internal\\Administrator"   # or delegated join account
+$SecretId = "dev/ad-join-password"
+$FlagFile = "C:\ProgramData\AdAuthDash\domain_join_done.flag"
+New-Item -ItemType Directory -Force -Path "C:\ProgramData\AdAuthDash" | Out-Null
+
+# Helper: create a scheduled task to continue after reboot
+function Register-ContinueTask {
+  $scriptPath = "C:\ProgramData\AdAuthDash\continue.ps1"
+  $taskName   = "AdAuthDash-Continue"
+
+  # Write the "phase 2" script (your existing IIS+deploy script)
+  @'
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+$SiteName   = "AdAuthDash"
+$AppPool    = "AdAuthDashPool"
+$AppRoot    = "C:\inetpub\wwwroot\AdAuthDash"
+$Port       = 80
+
+# 1) Install IIS + Windows Auth
+Install-WindowsFeature Web-Server, Web-Windows-Auth, Web-Mgmt-Tools | Out-Null
+
+# 2) Install ASP.NET Core Hosting Bundle (.NET 8) for IIS
+New-Item -ItemType Directory -Path C:\Temp -Force | Out-Null
+$HostingBundleUrl  = "https://download.visualstudio.microsoft.com/download/pr/3d2fe6b3-1d27-4e4c-a2c5-2a3a6b9c60f3/9b6c31b0a1d7e9b0e2a5b4b2f3a3e2d5/dotnet-hosting-8.0.8-win.exe"
+$HostingBundleExe  = "C:\Temp\dotnet-hosting-8.0.8-win.exe"
+try {
+    Invoke-WebRequest $HostingBundleUrl -OutFile $HostingBundleExe
+    Start-Process -FilePath $HostingBundleExe -ArgumentList "/install /quiet /norestart" -Wait
+} catch { }
+
+# 3) Deploy from S3
+New-Item -ItemType Directory -Path $AppRoot -Force | Out-Null
+aws s3 sync s3://terraform-state-hiba-2026/AdAuthDash $AppRoot --delete
+
+icacls $AppRoot /grant "IIS_IUSRS:(OI)(CI)RX" /T | Out-Null
+
+# 4) Create IIS App Pool + Site
+Import-Module WebAdministration
+if (-not (Test-Path "IIS:\AppPools\$AppPool")) { New-WebAppPool -Name $AppPool | Out-Null }
+Set-ItemProperty "IIS:\AppPools\$AppPool" -Name managedRuntimeVersion -Value ""
+Set-ItemProperty "IIS:\AppPools\$AppPool" -Name processModel.identityType -Value "ApplicationPoolIdentity"
+
+if (-not (Test-Path "IIS:\Sites\$SiteName")) {
+    New-Website -Name $SiteName -PhysicalPath $AppRoot -Port $Port -ApplicationPool $AppPool | Out-Null
+} else {
+    Set-ItemProperty "IIS:\Sites\$SiteName" -Name physicalPath -Value $AppRoot
+}
+
+# 5) Enable Windows Authentication
+Set-WebConfigurationProperty -PSPath "IIS:\Sites\$SiteName" `
+  -Filter /system.webServer/security/authentication/anonymousAuthentication -Name enabled -Value false
+Set-WebConfigurationProperty -PSPath "IIS:\Sites\$SiteName" `
+  -Filter /system.webServer/security/authentication/windowsAuthentication -Name enabled -Value true
+
+iisreset
+
+# Clean up scheduled task (run once)
+schtasks /Delete /TN "AdAuthDash-Continue" /F | Out-Null
+Remove-Item -Force "C:\ProgramData\AdAuthDash\continue.ps1" -ErrorAction SilentlyContinue
+'@ | Set-Content -Path $scriptPath -Encoding UTF8
+
+  schtasks /Create /TN $taskName /SC ONSTART /RU SYSTEM /RL HIGHEST /TR "powershell -ExecutionPolicy Bypass -File `"$scriptPath`"" /F | Out-Null
+}
+
+# =========================
+# PHASE 1: JOIN DOMAIN ONCE
+# =========================
+if (-not (Test-Path $FlagFile)) {
+
+  # Ensure AWS Tools for Secrets Manager
+  if (-not (Get-Command Get-SECSecretValue -ErrorAction SilentlyContinue)) {
+    Install-PackageProvider -Name NuGet -Force
+    Install-Module -Name AWS.Tools.SecretsManager -Force
+  }
+
+  $pwdPlain = (Get-SECSecretValue -SecretId $SecretId).SecretString
+  $pwd      = ConvertTo-SecureString $pwdPlain -AsPlainText -Force
+  $cred     = New-Object System.Management.Automation.PSCredential($JoinUser, $pwd)
+
+  Register-ContinueTask
+
+  Add-Computer -DomainName $Domain -Credential $cred -Force
+  New-Item -ItemType File -Path $FlagFile -Force | Out-Null
+
+  Restart-Computer -Force
+  exit
+}
+
+</powershell>
